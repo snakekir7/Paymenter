@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\Log;
     version: '1.0.0',
     author: 'Paymenter',
     url: 'https://yoomoney.ru',
-    icon: 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHZpZXdCb3g9IjAgMCA2NCA2NCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxMiIgZmlsbD0iIzhCQjRGRiIvPjx0ZXh0IHg9IjUwJSIgeT0iNTUlIiBkb21pbmFudC1iYXNlbGluZT0ibWlkZGxlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjMzMzIiBmb250LXNpemU9IjE0IiBmb250LWZhbWlseT0ic3lzdGVtLXVpIj5ZTTwvdGV4dD48L3N2Zz4K'
+    icon: '/images/gateways/yoomoney.svg'
 )]
 class YooMoneyWallet extends Gateway
 {
