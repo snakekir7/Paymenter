@@ -99,7 +99,44 @@ class YooMoneyWallet extends Gateway
                 'label' => 'Amount tolerance (RUB)',
                 'type' => 'number',
                 'required' => false,
-                'description' => 'Maximum difference between notification amount and invoice remaining. Default 0 (exact).',
+                'description' => 'Maximum difference between invoice remaining and the notification field used for matching (see Amount match basis). Default 0 (exact). Do not use this to mask commission or field mismatches.',
+            ],
+            [
+                'name' => 'fee_mode',
+                'label' => 'Fee mode',
+                'type' => 'select',
+                'required' => false,
+                'options' => [
+                    'receiver_fee' => 'Receiver fee — match withdraw_amount (recommended), record fee = withdraw_amount − amount',
+                    'none' => 'None — legacy: match selected basis only, fee not stored',
+                ],
+                'description' => 'Default: receiver_fee. In receiver_fee mode, invoice is credited by withdraw_amount (gross) when that is the match field; YooMoney commission is stored as transaction fee.',
+            ],
+            [
+                'name' => 'amount_match_basis',
+                'label' => 'Amount match basis',
+                'type' => 'select',
+                'required' => false,
+                'options' => [
+                    'withdraw_amount' => 'withdraw_amount — amount debited from payer (matches quickpay sum)',
+                    'amount' => 'amount — credited to wallet (legacy strict)',
+                    'auto' => 'auto — withdraw_amount if present, else amount',
+                ],
+                'description' => 'Default: withdraw_amount. Compared to invoice remaining (with amount tolerance).',
+            ],
+            [
+                'name' => 'require_withdraw_amount',
+                'label' => 'Require withdraw_amount when basis needs it',
+                'type' => 'checkbox',
+                'required' => false,
+                'description' => 'When enabled (default), notifications without withdraw_amount are rejected if the selected basis is withdraw_amount and auto cannot supply it. Disable only for legacy payloads.',
+            ],
+            [
+                'name' => 'max_fee_tolerance',
+                'label' => 'Max fee tolerance (RUB)',
+                'type' => 'number',
+                'required' => false,
+                'description' => 'In receiver_fee mode: reject if (withdraw_amount − amount) exceeds this value. Leave empty or 0 for no upper cap (only non-negative fee is required).',
             ],
             [
                 'name' => 'test_mode',
@@ -287,12 +324,25 @@ class YooMoneyWallet extends Gateway
         }
 
         $expected = $this->expectedAmount($invoice);
-        $actual = $this->normalizeMoneyString((string) $payload['amount']);
-        if (!$this->amountsMatch($expected, $actual)) {
+        $matchAmount = $this->selectedMatchAmount($payload);
+        if ($matchAmount === null) {
+            if ($this->requiresWithdrawAmount()) {
+                $this->safeLog('warning', 'yoomoney_wallet.notification.withdraw_amount_missing', [
+                    'invoice_id' => $invoice->id,
+                    'amount_match_basis' => $this->amountMatchBasis(),
+                ]);
+
+                return response('Bad Request', 400);
+            }
+            $matchAmount = $this->notificationAmount($payload);
+        }
+
+        if (!$this->amountsMatch($expected, $matchAmount)) {
             $this->safeLog('warning', 'yoomoney_wallet.notification.amount_mismatch', [
                 'invoice_id' => $invoice->id,
                 'expected' => $expected,
-                'actual' => $actual,
+                'match_amount' => $matchAmount,
+                'amount_match_basis' => $this->amountMatchBasis(),
             ]);
 
             return response('Bad Request', 400);
@@ -303,17 +353,56 @@ class YooMoneyWallet extends Gateway
             return response('Bad Request', 400);
         }
 
-        $amountFloat = (float) $actual;
-        ExtensionHelper::addPayment($invoice->id, 'YooMoneyWallet', $amountFloat, null, $operationId);
+        $netNormalized = $this->notificationAmount($payload);
 
-        $this->safeLog('info', 'yoomoney_wallet.notification.accepted', [
-            'invoice_id' => $invoice->id,
-            'operation_id' => $operationId,
-            'amount' => $amountFloat,
-            'currency' => '643',
-            'notification_type' => $notificationType,
-            'receiver_wallet_masked' => $this->maskWallet((string) $this->config('wallet_account')),
-        ]);
+        if ($this->feeModeIsReceiverFee()) {
+            $fee = $this->calculateFee($matchAmount, $netNormalized);
+            if ($fee === null) {
+                $this->safeLog('warning', 'yoomoney_wallet.notification.negative_fee', [
+                    'invoice_id' => $invoice->id,
+                    'gross_match' => $matchAmount,
+                    'net_credited' => $netNormalized,
+                ]);
+
+                return response('Bad Request', 400);
+            }
+
+            if ($this->feeExceedsMaxTolerance($fee)) {
+                $this->safeLog('warning', 'yoomoney_wallet.notification.fee_above_max_tolerance', [
+                    'invoice_id' => $invoice->id,
+                    'fee' => $fee,
+                    'max_fee_tolerance' => $this->maxFeeTolerance(),
+                ]);
+
+                return response('Bad Request', 400);
+            }
+
+            $paymentAmount = (float) $matchAmount;
+            ExtensionHelper::addPayment($invoice->id, 'YooMoneyWallet', $paymentAmount, $fee, $operationId);
+
+            $this->safeLog('info', 'yoomoney_wallet.notification.accepted', [
+                'invoice_id' => $invoice->id,
+                'operation_id' => $operationId,
+                'payment_amount' => $paymentAmount,
+                'fee' => $fee,
+                'net_credited' => (float) $netNormalized,
+                'currency' => '643',
+                'notification_type' => $notificationType,
+                'receiver_wallet_masked' => $this->maskWallet((string) $this->config('wallet_account')),
+            ]);
+        } else {
+            $paymentAmount = (float) $matchAmount;
+            ExtensionHelper::addPayment($invoice->id, 'YooMoneyWallet', $paymentAmount, null, $operationId);
+
+            $this->safeLog('info', 'yoomoney_wallet.notification.accepted', [
+                'invoice_id' => $invoice->id,
+                'operation_id' => $operationId,
+                'amount' => $paymentAmount,
+                'currency' => '643',
+                'notification_type' => $notificationType,
+                'receiver_wallet_masked' => $this->maskWallet((string) $this->config('wallet_account')),
+            ]);
+        }
 
         return response('OK', 200);
     }
@@ -425,6 +514,103 @@ class YooMoneyWallet extends Gateway
         $tol = (float) ($this->config('amount_tolerance') ?? 0);
 
         return abs($e - $a) <= $tol + 1e-9;
+    }
+
+    private function notificationAmount(array $payload): string
+    {
+        return $this->normalizeMoneyString((string) $payload['amount']);
+    }
+
+    private function notificationWithdrawAmount(array $payload): ?string
+    {
+        if (! array_key_exists('withdraw_amount', $payload)) {
+            return null;
+        }
+        $w = $payload['withdraw_amount'];
+        if ($w === null || $w === '') {
+            return null;
+        }
+
+        return $this->normalizeMoneyString((string) $w);
+    }
+
+    private function amountMatchBasis(): string
+    {
+        $b = strtolower((string) ($this->config('amount_match_basis') ?? 'withdraw_amount'));
+        if (in_array($b, ['amount', 'withdraw_amount', 'auto'], true)) {
+            return $b;
+        }
+
+        return 'withdraw_amount';
+    }
+
+    private function selectedMatchAmount(array $payload): ?string
+    {
+        $basis = $this->amountMatchBasis();
+        $amount = $this->notificationAmount($payload);
+        $withdraw = $this->notificationWithdrawAmount($payload);
+
+        return match ($basis) {
+            'amount' => $amount,
+            'withdraw_amount' => $withdraw,
+            'auto' => $withdraw ?? $amount,
+            default => $withdraw ?? $amount,
+        };
+    }
+
+    private function requiresWithdrawAmount(): bool
+    {
+        $v = $this->config('require_withdraw_amount');
+        if ($v === null || $v === '') {
+            return true;
+        }
+
+        return filter_var($v, FILTER_VALIDATE_BOOLEAN) || $v === '1' || $v === 1;
+    }
+
+    private function feeModeIsReceiverFee(): bool
+    {
+        $m = strtolower((string) ($this->config('fee_mode') ?? 'receiver_fee'));
+
+        return $m !== 'none';
+    }
+
+    /**
+     * @return float|null Rounded fee in major units, or null if gross is less than net (invalid notification).
+     */
+    private function calculateFee(string $grossNormalized, string $netNormalized): ?float
+    {
+        $gross = (float) $grossNormalized;
+        $net = (float) $netNormalized;
+        if ($gross + 1e-9 < $net) {
+            return null;
+        }
+        $fee = $gross - $net;
+        if ($fee < 0) {
+            $fee = 0.0;
+        }
+
+        return round($fee, 2);
+    }
+
+    private function maxFeeTolerance(): float
+    {
+        $v = $this->config('max_fee_tolerance');
+        if ($v === null || $v === '') {
+            return 0.0;
+        }
+
+        return (float) $v;
+    }
+
+    private function feeExceedsMaxTolerance(float $fee): bool
+    {
+        $max = $this->maxFeeTolerance();
+        if ($max <= 1e-9) {
+            return false;
+        }
+
+        return $fee > $max + 1e-9;
     }
 
     private function maskWallet(?string $wallet): string

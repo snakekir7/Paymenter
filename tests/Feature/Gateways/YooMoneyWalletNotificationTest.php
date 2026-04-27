@@ -181,6 +181,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-unique-1',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -193,7 +194,10 @@ class YooMoneyWalletNotificationTest extends TestCase
         $invoice->refresh();
         $this->assertEquals(Invoice::STATUS_PAID, $invoice->status);
         $this->assertEquals(1, $invoice->transactions()->count());
-        $this->assertEquals('op-unique-1', $invoice->transactions->first()->transaction_id);
+        $tx = $invoice->transactions->first();
+        $this->assertEquals('op-unique-1', $tx->transaction_id);
+        $this->assertEquals(100.00, (float) $tx->amount);
+        $this->assertEquals(0.00, (float) $tx->fee);
     }
 
     public function test_valid_signed_notification_with_sha1_hash_in_payload(): void
@@ -210,6 +214,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-with-sha1',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
             'sha1_hash' => '8693ddf402fe5dcc4c4744d466cabada2628148c',
@@ -235,6 +240,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-no-sha1',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -333,6 +339,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-amt',
             'amount' => '50.00',
+            'withdraw_amount' => '50.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -357,6 +364,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-ccy',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '840',
             'label' => $label,
         ];
@@ -403,6 +411,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-unknown-label',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => 'wrong_label_not_stored',
         ];
@@ -426,6 +435,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-dup-1',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -452,6 +462,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'card-incoming',
             'operation_id' => 'op-card',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -478,6 +489,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'card-incoming',
             'operation_id' => 'op-card-ok',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
         ];
@@ -502,6 +514,7 @@ class YooMoneyWalletNotificationTest extends TestCase
             'notification_type' => 'p2p-incoming',
             'operation_id' => 'op-test',
             'amount' => '100.00',
+            'withdraw_amount' => '100.00',
             'currency' => '643',
             'label' => $label,
             'test_notification' => 'true',
@@ -527,6 +540,193 @@ class YooMoneyWalletNotificationTest extends TestCase
         $payload['sign'] = $this->signPayload($payload, self::SECRET);
 
         $this->post($this->notificationEndpoint(), $payload)->assertOk();
+    }
+
+    public function test_receiver_fee_accepts_withdraw_amount_equal_invoice_and_amount_lower(): void
+    {
+        $this->seedGateway($this->baseConfig());
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-receiver-fee-1',
+            'amount' => '98.00',
+            'withdraw_amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertOk();
+
+        $invoice->refresh();
+        $this->assertEquals(Invoice::STATUS_PAID, $invoice->status);
+        $tx = $invoice->transactions->first();
+        $this->assertEquals('op-receiver-fee-1', $tx->transaction_id);
+        $this->assertEquals(100.00, (float) $tx->amount);
+        $this->assertEquals(2.00, (float) $tx->fee);
+    }
+
+    public function test_receiver_fee_rejects_missing_withdraw_amount(): void
+    {
+        $this->seedGateway($this->baseConfig());
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-no-withdraw',
+            'amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertBadRequest();
+        $this->assertEquals(0, $invoice->fresh()->transactions()->count());
+    }
+
+    public function test_legacy_none_mode_accepts_amount_without_withdraw(): void
+    {
+        $cfg = $this->baseConfig();
+        $cfg['fee_mode'] = 'none';
+        $cfg['amount_match_basis'] = 'amount';
+        $cfg['require_withdraw_amount'] = '0';
+        $this->seedGateway($cfg);
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-legacy',
+            'amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertOk();
+        $invoice->refresh();
+        $this->assertEquals(Invoice::STATUS_PAID, $invoice->status);
+        $tx = $invoice->transactions->first();
+        $this->assertEquals(100.00, (float) $tx->amount);
+        $this->assertNull($tx->fee);
+    }
+
+    public function test_auto_basis_falls_back_to_amount_when_withdraw_missing_and_require_false(): void
+    {
+        $cfg = $this->baseConfig();
+        $cfg['amount_match_basis'] = 'auto';
+        $cfg['require_withdraw_amount'] = '0';
+        $this->seedGateway($cfg);
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-auto-fallback',
+            'amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertOk();
+        $this->assertEquals(Invoice::STATUS_PAID, $invoice->fresh()->status);
+    }
+
+    public function test_receiver_fee_rejects_negative_fee(): void
+    {
+        $this->seedGateway($this->baseConfig());
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-neg-fee',
+            'amount' => '101.00',
+            'withdraw_amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertBadRequest();
+        $this->assertEquals(0, $invoice->fresh()->transactions()->count());
+    }
+
+    public function test_max_fee_tolerance_rejects_excessive_fee(): void
+    {
+        $cfg = $this->baseConfig();
+        $cfg['max_fee_tolerance'] = '1.00';
+        $this->seedGateway($cfg);
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-max-fee',
+            'amount' => '98.00',
+            'withdraw_amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertBadRequest();
+        $this->assertEquals(0, $invoice->fresh()->transactions()->count());
+    }
+
+    public function test_test_notification_with_withdraw_does_not_credit(): void
+    {
+        $this->seedGateway($this->baseConfig());
+        $invoice = $this->makeRubInvoice(100.00);
+        $label = 'prom_inv_'.$invoice->id.'_abcd1234';
+        $invoice->properties()->updateOrCreate(
+            ['key' => 'yoomoney_wallet_label'],
+            ['value' => $label]
+        );
+
+        $payload = [
+            'notification_type' => 'p2p-incoming',
+            'operation_id' => 'op-test-withdraw',
+            'amount' => '98.00',
+            'withdraw_amount' => '100.00',
+            'currency' => '643',
+            'label' => $label,
+            'test_notification' => 'true',
+        ];
+        $payload['sign'] = $this->signPayload($payload, self::SECRET);
+
+        $this->post($this->notificationEndpoint(), $payload)->assertOk();
+        $invoice->refresh();
+        $this->assertEquals(Invoice::STATUS_PENDING, $invoice->status);
+        $this->assertEquals(0, $invoice->transactions()->count());
     }
 
 }
